@@ -125,6 +125,39 @@ async function downloadTwilioMedia(url) {
   return Buffer.from(arrayBuffer);
 }
 
+// Trascrive un audio usando Google Cloud Speech-to-Text
+async function transcribeAudio(buffer, mimeType) {
+  const apiKey = process.env.GOOGLE_SPEECH_API_KEY;
+  const audioBase64 = buffer.toString('base64');
+
+  // I messaggi vocali WhatsApp arrivano tipicamente come audio/ogg con codec opus, 16kHz
+  const config = {
+    encoding: 'OGG_OPUS',
+    sampleRateHertz: 16000,
+    languageCode: 'it-IT'
+  };
+
+  const response = await fetch(`https://speech.googleapis.com/v1/speech:recognize?key=${apiKey}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      config,
+      audio: { content: audioBase64 }
+    })
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(`Trascrizione fallita: ${JSON.stringify(data)}`);
+  }
+
+  return (data.results || [])
+    .map(r => r.alternatives?.[0]?.transcript || '')
+    .join(' ')
+    .trim();
+}
+
 function extensionFromMimeType(mimeType) {
   const map = {
     'image/jpeg': 'jpg',
@@ -233,14 +266,39 @@ app.post('/webhook/whatsapp', async (req, res) => {
       );
     }
 
-    // Caso 2: altri allegati (audio, ecc.) - non ancora supportati
-    if (numMedia > 0) {
+    // Caso 2: messaggio vocale
+    if (numMedia > 0 && mediaType && mediaType.startsWith('audio/')) {
+      const audioBuffer = await downloadTwilioMedia(mediaUrl);
+      const transcript = await transcribeAudio(audioBuffer, mediaType);
+
+      if (!transcript) {
+        return res.send(
+          '<Response><Message>Non sono riuscito a trascrivere il messaggio vocale (nessun testo riconosciuto).</Message></Response>'
+        );
+      }
+
+      const { categoria, tag, titolo } = await classifyMessage(transcript);
+      const { folderName, filename } = await saveNote({
+        categoria,
+        tag: tag || [],
+        titolo: titolo || 'nota-vocale',
+        contenuto: `Trascrizione vocale:\n\n${transcript}`,
+        fonte: 'WhatsApp (vocale)'
+      });
+
       return res.send(
-        '<Response><Message>Ho ricevuto un allegato non supportato (es. audio). Il supporto sara aggiunto in un prossimo step. Per ora invia testo o screenshot.</Message></Response>'
+        `<Response><Message>Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}\n\nTrascrizione: ${transcript}</Message></Response>`
       );
     }
 
-    // Caso 3: messaggio di testo
+    // Caso 3: altri allegati - non ancora supportati
+    if (numMedia > 0) {
+      return res.send(
+        '<Response><Message>Ho ricevuto un allegato non supportato. Per ora invia testo, screenshot o messaggi vocali.</Message></Response>'
+      );
+    }
+
+    // Caso 4: messaggio di testo
     if (!body || !body.trim()) {
       return res.send('<Response><Message>Messaggio vuoto, niente da salvare.</Message></Response>');
     }
