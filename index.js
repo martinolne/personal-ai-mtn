@@ -158,16 +158,6 @@ async function transcribeAudio(buffer, mimeType) {
     .trim();
 }
 
-// Rende sicuro un testo da inserire in una risposta XML (TwiML)
-function escapeXml(str) {
-  return String(str || '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
 function extensionFromMimeType(mimeType) {
   const map = {
     'image/jpeg': 'jpg',
@@ -242,18 +232,49 @@ ${bodyContent}
   return { folderName, filename };
 }
 
-// Webhook chiamato da Twilio quando arriva un messaggio WhatsApp
-app.post('/webhook/whatsapp', async (req, res) => {
-  const body = req.body.Body;
-  const numMedia = parseInt(req.body.NumMedia || '0', 10);
-  const mediaUrl = req.body.MediaUrl0;
-  const mediaType = req.body.MediaContentType0;
+// Invia un messaggio WhatsApp tramite le API REST di Twilio
+async function sendWhatsAppMessage(from, to, body) {
+  const accountSid = process.env.TWILIO_ACCOUNT_SID;
+  const authToken = process.env.TWILIO_AUTH_TOKEN;
+  const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
 
-  res.set('Content-Type', 'text/xml');
+  const params = new URLSearchParams();
+  params.append('From', from);
+  params.append('To', to);
+  params.append('Body', body);
+
+  const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${auth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: params.toString()
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    console.error('Errore invio messaggio Twilio:', response.status, text);
+  } else {
+    console.log('Risposta inviata su WhatsApp con successo');
+  }
+}
+
+// Elabora il messaggio in arrivo (eseguito dopo aver risposto a Twilio)
+async function processIncomingMessage(payload) {
+  const body = payload.Body;
+  const from = payload.From; // numero dell'utente, es. whatsapp:+39...
+  const to = payload.To;     // numero sandbox Twilio, es. whatsapp:+14155238886
+  const numMedia = parseInt(payload.NumMedia || '0', 10);
+  const mediaUrl = payload.MediaUrl0;
+  const mediaType = payload.MediaContentType0;
+
+  let replyText;
 
   try {
     // Caso 1: screenshot / immagine
     if (numMedia > 0 && mediaType && mediaType.startsWith('image/')) {
+      console.log('Elaboro screenshot...');
       const imageBuffer = await downloadTwilioMedia(mediaUrl);
       const base64Data = imageBuffer.toString('base64');
       const { categoria, tag, titolo, descrizione } = await classifyImage(base64Data, mediaType);
@@ -271,64 +292,70 @@ app.post('/webhook/whatsapp', async (req, res) => {
         }
       });
 
-      return res.send(
-        `<Response><Message>Salvato in ${escapeXml(folderName)}/${escapeXml(filename)}\nCategoria: ${escapeXml(categoria)}\nTag: ${escapeXml((tag || []).join(', '))}</Message></Response>`
-      );
-    }
+      replyText = `Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}`;
 
     // Caso 2: messaggio vocale
-    if (numMedia > 0 && mediaType && mediaType.startsWith('audio/')) {
+    } else if (numMedia > 0 && mediaType && mediaType.startsWith('audio/')) {
+      console.log('Elaboro messaggio vocale...');
       const audioBuffer = await downloadTwilioMedia(mediaUrl);
       const transcript = await transcribeAudio(audioBuffer, mediaType);
 
       if (!transcript) {
-        return res.send(
-          '<Response><Message>Non sono riuscito a trascrivere il messaggio vocale (nessun testo riconosciuto).</Message></Response>'
-        );
+        replyText = 'Non sono riuscito a trascrivere il messaggio vocale (nessun testo riconosciuto).';
+      } else {
+        const { categoria, tag, titolo } = await classifyMessage(transcript);
+        const { folderName, filename } = await saveNote({
+          categoria,
+          tag: tag || [],
+          titolo: titolo || 'nota-vocale',
+          contenuto: `Trascrizione vocale:\n\n${transcript}`,
+          fonte: 'WhatsApp (vocale)'
+        });
+
+        replyText = `Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}\n\nTrascrizione: ${transcript}`;
       }
 
-      const { categoria, tag, titolo } = await classifyMessage(transcript);
+    // Caso 3: altri allegati - non ancora supportati
+    } else if (numMedia > 0) {
+      replyText = 'Ho ricevuto un allegato non supportato. Per ora invia testo, screenshot o messaggi vocali.';
+
+    // Caso 4: messaggio di testo
+    } else if (!body || !body.trim()) {
+      replyText = 'Messaggio vuoto, niente da salvare.';
+
+    } else {
+      console.log('Elaboro messaggio di testo...');
+      const { categoria, tag, titolo } = await classifyMessage(body);
       const { folderName, filename } = await saveNote({
         categoria,
         tag: tag || [],
-        titolo: titolo || 'nota-vocale',
-        contenuto: `Trascrizione vocale:\n\n${transcript}`,
-        fonte: 'WhatsApp (vocale)'
+        titolo: titolo || 'nota',
+        contenuto: body,
+        fonte: 'WhatsApp'
       });
 
-      return res.send(
-        `<Response><Message>Salvato in ${escapeXml(folderName)}/${escapeXml(filename)}\nCategoria: ${escapeXml(categoria)}\nTag: ${escapeXml((tag || []).join(', '))}\n\nTrascrizione: ${escapeXml(transcript)}</Message></Response>`
-      );
+      replyText = `Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}`;
     }
-
-    // Caso 3: altri allegati - non ancora supportati
-    if (numMedia > 0) {
-      return res.send(
-        '<Response><Message>Ho ricevuto un allegato non supportato. Per ora invia testo, screenshot o messaggi vocali.</Message></Response>'
-      );
-    }
-
-    // Caso 4: messaggio di testo
-    if (!body || !body.trim()) {
-      return res.send('<Response><Message>Messaggio vuoto, niente da salvare.</Message></Response>');
-    }
-
-    const { categoria, tag, titolo } = await classifyMessage(body);
-    const { folderName, filename } = await saveNote({
-      categoria,
-      tag: tag || [],
-      titolo: titolo || 'nota',
-      contenuto: body,
-      fonte: 'WhatsApp'
-    });
-
-    res.send(
-      `<Response><Message>Salvato in ${escapeXml(folderName)}/${escapeXml(filename)}\nCategoria: ${escapeXml(categoria)}\nTag: ${escapeXml((tag || []).join(', '))}</Message></Response>`
-    );
   } catch (err) {
-    console.error(err);
-    res.send('<Response><Message>Errore durante il salvataggio della nota. Controlla i log del server.</Message></Response>');
+    console.error('Errore durante l\'elaborazione:', err);
+    replyText = 'Errore durante il salvataggio della nota. Controlla i log del server.';
   }
+
+  console.log('Invio risposta:', replyText);
+  await sendWhatsAppMessage(to, from, replyText);
+}
+
+// Webhook chiamato da Twilio quando arriva un messaggio WhatsApp
+app.post('/webhook/whatsapp', (req, res) => {
+  console.log('Messaggio ricevuto da', req.body.From);
+
+  // Risponde subito a Twilio per evitare timeout, poi elabora in background
+  res.set('Content-Type', 'text/xml');
+  res.send('<Response></Response>');
+
+  processIncomingMessage(req.body).catch(err => {
+    console.error('Errore non gestito nell\'elaborazione:', err);
+  });
 });
 
 app.get('/', (req, res) => res.send('Agente AI Personale - server attivo'));
