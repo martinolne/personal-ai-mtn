@@ -26,6 +26,8 @@ const CATEGORY_FOLDERS = {
   Nota: 'Inbox'
 };
 
+const SUMMARY_FOLDER = 'Riepiloghi';
+
 const folderCache = {};
 
 // Trova (o crea) una sottocartella del vault e ne restituisce l'ID
@@ -232,7 +234,139 @@ ${bodyContent}
   return { folderName, filename };
 }
 
-// Invia un messaggio WhatsApp tramite le API REST di Twilio
+// Recupera le note create negli ultimi N giorni, raggruppate per categoria
+async function listRecentNotes(days) {
+  const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const notesByCategory = {};
+
+  for (const categoria of Object.keys(CATEGORY_FOLDERS)) {
+    const folderName = CATEGORY_FOLDERS[categoria];
+    const folderId = await getOrCreateFolder(folderName);
+
+    const res = await drive.files.list({
+      q: `'${folderId}' in parents and mimeType='text/markdown' and createdTime > '${sinceDate}' and trashed=false`,
+      fields: 'files(id, name)',
+      orderBy: 'createdTime'
+    });
+
+    const notes = [];
+    for (const file of res.data.files || []) {
+      const content = await drive.files.get(
+        { fileId: file.id, alt: 'media' },
+        { responseType: 'text' }
+      );
+
+      notes.push({
+        filename: file.name,
+        title: file.name.replace(/\.md$/, ''), // nome senza estensione, per i wikilink
+        content: typeof content.data === 'string' ? content.data : ''
+      });
+    }
+
+    if (notes.length > 0) {
+      notesByCategory[categoria] = notes;
+    }
+  }
+
+  return notesByCategory;
+}
+
+// Chiede a Claude un riepilogo narrativo delle note della settimana
+async function generateWeeklySummary(notesByCategory) {
+  const sections = Object.entries(notesByCategory)
+    .map(([categoria, notes]) => {
+      const items = notes.map(n => `--- ${n.title} ---\n${n.content}`).join('\n\n');
+      return `## ${categoria}\n${items}`;
+    })
+    .join('\n\n');
+
+  if (!sections.trim()) {
+    return 'Questa settimana non sono state create nuove note.';
+  }
+
+  const msg = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 1000,
+    system: `Sei un assistente che prepara un riepilogo settimanale delle note personali dell'utente, da inviare via WhatsApp e salvare in un vault Obsidian.
+Ricevi le note raccolte durante la settimana, organizzate per categoria (Idea, Impegno, Riferimento, Nota).
+
+Scrivi un riepilogo in italiano, in prosa, conciso (massimo 4-5 paragrafi brevi), che:
+- evidenzi per primi gli Impegni con scadenze imminenti o rilevanti
+- raggruppi e sintetizzi le Idee principali
+- segnali eventuali Riferimenti importanti
+- non elenchi semplicemente ogni nota, ma sintetizzi i contenuti
+
+Scrivi in paragrafi normali, senza titoli Markdown o elenchi puntati estesi, in modo che sia leggibile anche su WhatsApp.`,
+    messages: [{ role: 'user', content: sections }]
+  });
+
+  return msg.content.find(b => b.type === 'text')?.text?.trim() || 'Riepilogo non disponibile.';
+}
+
+// Costruisce il contenuto Markdown della nota di riepilogo, con collegamenti alle note della settimana
+function buildSummaryNote(narrative, notesByCategory, dateStr) {
+  let body = `${narrative}\n\n## Note di questa settimana\n`;
+
+  for (const [categoria, notes] of Object.entries(notesByCategory)) {
+    body += `\n### ${categoria}\n`;
+    for (const note of notes) {
+      body += `- [[${note.title}]]\n`;
+    }
+  }
+
+  return `---
+data: ${dateStr}
+categoria: Riepilogo
+tag: ["riepilogo-settimanale"]
+fonte: Automatico
+---
+
+${body}`;
+}
+
+// Salva la nota di riepilogo nella cartella dedicata del vault
+async function saveWeeklySummaryNote(content, dateStr) {
+  const folderId = await getOrCreateFolder(SUMMARY_FOLDER);
+  const filename = `${dateStr}-riepilogo-settimanale.md`;
+
+  await drive.files.create({
+    requestBody: {
+      name: filename,
+      parents: [folderId],
+      mimeType: 'text/markdown'
+    },
+    media: {
+      mimeType: 'text/markdown',
+      body: content
+    }
+  });
+
+  return filename;
+}
+
+// Esegue l'intero processo di riepilogo settimanale
+async function runWeeklySummary() {
+  console.log('Avvio riepilogo settimanale...');
+
+  const notesByCategory = await listRecentNotes(7);
+  const narrative = await generateWeeklySummary(notesByCategory);
+
+  const dateStr = new Date().toISOString().slice(0, 10);
+  const noteContent = buildSummaryNote(narrative, notesByCategory, dateStr);
+  const filename = await saveWeeklySummaryNote(noteContent, dateStr);
+
+  const whatsappText = `${narrative}\n\nRiepilogo completo salvato in ${SUMMARY_FOLDER}/${filename}`;
+
+  await sendWhatsAppMessage(
+    process.env.TWILIO_WHATSAPP_FROM,
+    process.env.USER_WHATSAPP_NUMBER,
+    whatsappText
+  );
+
+  console.log('Riepilogo settimanale completato.');
+}
+
+
 async function sendWhatsAppMessage(from, to, body) {
   const accountSid = process.env.TWILIO_ACCOUNT_SID;
   const authToken = process.env.TWILIO_AUTH_TOKEN;
@@ -359,6 +493,19 @@ app.post('/webhook/whatsapp', (req, res) => {
 });
 
 app.get('/', (req, res) => res.send('Agente AI Personale - server attivo'));
+
+// Endpoint per attivare il riepilogo settimanale (chiamato da un servizio cron esterno)
+app.get('/cron/weekly-summary', (req, res) => {
+  if (req.query.key !== process.env.CRON_SECRET) {
+    return res.status(403).send('Non autorizzato');
+  }
+
+  res.send('Riepilogo avviato');
+
+  runWeeklySummary().catch(err => {
+    console.error('Errore durante il riepilogo settimanale:', err);
+  });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server in ascolto sulla porta ${PORT}`));
