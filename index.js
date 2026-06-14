@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const { google } = require('googleapis');
 const Anthropic = require('@anthropic-ai/sdk');
+const { Readable } = require('stream');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
@@ -54,7 +55,18 @@ async function getOrCreateFolder(name) {
   return folder.data.id;
 }
 
-// Chiede a Claude di classificare il messaggio
+// Estrae il primo oggetto JSON valido dalla risposta di Claude
+function extractJson(rawText, fallback) {
+  const jsonMatch = (rawText || '').match(/\{[\s\S]*\}/);
+  const jsonStr = jsonMatch ? jsonMatch[0] : rawText;
+  try {
+    return JSON.parse(jsonStr);
+  } catch {
+    return fallback;
+  }
+}
+
+// Chiede a Claude di classificare un messaggio di testo
 async function classifyMessage(text) {
   const msg = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
@@ -70,14 +82,57 @@ Categorie:
     messages: [{ role: 'user', content: text }]
   });
 
- const raw = msg.content.find(b => b.type === 'text')?.text || '{}';
-  const jsonMatch = raw.match(/\{[\s\S]*\}/);
-  const jsonStr = jsonMatch ? jsonMatch[0] : raw;
-  try {
-    return JSON.parse(jsonStr);
-  } catch {
-    return { categoria: 'Nota', tag: [], titolo: 'nota-senza-titolo' };
+  const raw = msg.content.find(b => b.type === 'text')?.text || '{}';
+  return extractJson(raw, { categoria: 'Nota', tag: [], titolo: 'nota-senza-titolo' });
+}
+
+// Chiede a Claude di analizzare e classificare uno screenshot
+async function classifyImage(base64Data, mediaType) {
+  const msg = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 500,
+    system: `Sei un assistente che organizza note personali a partire da screenshot. Analizza l'immagine e rispondi SOLO con un oggetto JSON valido, senza testo aggiuntivo, nel formato:
+{"categoria": "Idea|Impegno|Riferimento|Nota", "tag": ["tag1","tag2"], "titolo": "titolo breve in 3-6 parole", "descrizione": "descrizione/trascrizione del contenuto dello screenshot, 1-4 frasi"}
+
+Categorie:
+- Idea: pensieri, spunti, progetti futuri
+- Impegno: scadenze, cose da fare, appuntamenti
+- Riferimento: informazioni utili da conservare, link, contatti
+- Nota: tutto il resto`,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64Data } },
+        { type: 'text', text: 'Analizza questo screenshot e classificalo.' }
+      ]
+    }]
+  });
+
+  const raw = msg.content.find(b => b.type === 'text')?.text || '{}';
+  return extractJson(raw, { categoria: 'Nota', tag: [], titolo: 'screenshot-senza-titolo', descrizione: '' });
+}
+
+// Scarica un allegato da Twilio (richiede autenticazione Basic)
+async function downloadTwilioMedia(url) {
+  const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+  const response = await fetch(url, {
+    headers: { Authorization: `Basic ${auth}` }
+  });
+  if (!response.ok) {
+    throw new Error(`Download allegato Twilio fallito: ${response.status}`);
   }
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
+}
+
+function extensionFromMimeType(mimeType) {
+  const map = {
+    'image/jpeg': 'jpg',
+    'image/png': 'png',
+    'image/gif': 'gif',
+    'image/webp': 'webp'
+  };
+  return map[mimeType] || 'jpg';
 }
 
 function slugify(str) {
@@ -88,15 +143,36 @@ function slugify(str) {
     .replace(/\s+/g, '-');
 }
 
-// Crea il file Markdown nella cartella corretta del vault
-async function saveNote({ categoria, tag, titolo, contenuto, fonte }) {
+// Crea il file Markdown (ed eventualmente l'immagine collegata) nella cartella corretta del vault
+async function saveNote({ categoria, tag, titolo, contenuto, fonte, image }) {
   const folderName = CATEGORY_FOLDERS[categoria] || 'Inbox';
   const folderId = await getOrCreateFolder(folderName);
 
   const now = new Date();
   const dateStr = now.toISOString().slice(0, 10);
   const timeStr = now.toISOString().slice(11, 19).replace(/:/g, '');
-  const filename = `${dateStr}-${timeStr}-${slugify(titolo)}.md`;
+  const baseName = `${dateStr}-${timeStr}-${slugify(titolo)}`;
+  const filename = `${baseName}.md`;
+
+  let bodyContent = contenuto || '';
+
+  if (image) {
+    const imageFilename = `${baseName}.${image.extension}`;
+
+    await drive.files.create({
+      requestBody: {
+        name: imageFilename,
+        parents: [folderId],
+        mimeType: image.mimeType
+      },
+      media: {
+        mimeType: image.mimeType,
+        body: Readable.from(image.buffer)
+      }
+    });
+
+    bodyContent = `![[${imageFilename}]]\n\n${bodyContent}`;
+  }
 
   const fileContent = `---
 data: ${dateStr}
@@ -105,7 +181,7 @@ tag: [${(tag || []).map(t => `"${t}"`).join(', ')}]
 fonte: ${fonte}
 ---
 
-${contenuto}
+${bodyContent}
 `;
 
   await drive.files.create({
@@ -127,20 +203,48 @@ ${contenuto}
 app.post('/webhook/whatsapp', async (req, res) => {
   const body = req.body.Body;
   const numMedia = parseInt(req.body.NumMedia || '0', 10);
+  const mediaUrl = req.body.MediaUrl0;
+  const mediaType = req.body.MediaContentType0;
 
   res.set('Content-Type', 'text/xml');
 
-  if (numMedia > 0) {
-    return res.send(
-      '<Response><Message>Ho ricevuto un allegato (audio/immagine). Il supporto per questi contenuti sara aggiunto in un prossimo step. Per ora invia il contenuto come testo.</Message></Response>'
-    );
-  }
-
-  if (!body || !body.trim()) {
-    return res.send('<Response><Message>Messaggio vuoto, niente da salvare.</Message></Response>');
-  }
-
   try {
+    // Caso 1: screenshot / immagine
+    if (numMedia > 0 && mediaType && mediaType.startsWith('image/')) {
+      const imageBuffer = await downloadTwilioMedia(mediaUrl);
+      const base64Data = imageBuffer.toString('base64');
+      const { categoria, tag, titolo, descrizione } = await classifyImage(base64Data, mediaType);
+
+      const { folderName, filename } = await saveNote({
+        categoria,
+        tag: tag || [],
+        titolo: titolo || 'screenshot',
+        contenuto: descrizione || (body || ''),
+        fonte: 'WhatsApp (screenshot)',
+        image: {
+          buffer: imageBuffer,
+          mimeType: mediaType,
+          extension: extensionFromMimeType(mediaType)
+        }
+      });
+
+      return res.send(
+        `<Response><Message>Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}</Message></Response>`
+      );
+    }
+
+    // Caso 2: altri allegati (audio, ecc.) - non ancora supportati
+    if (numMedia > 0) {
+      return res.send(
+        '<Response><Message>Ho ricevuto un allegato non supportato (es. audio). Il supporto sara aggiunto in un prossimo step. Per ora invia testo o screenshot.</Message></Response>'
+      );
+    }
+
+    // Caso 3: messaggio di testo
+    if (!body || !body.trim()) {
+      return res.send('<Response><Message>Messaggio vuoto, niente da salvare.</Message></Response>');
+    }
+
     const { categoria, tag, titolo } = await classifyMessage(body);
     const { folderName, filename } = await saveNote({
       categoria,
