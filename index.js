@@ -70,9 +70,11 @@ Categorie:
     messages: [{ role: 'user', content: text }]
   });
 
-  const raw = msg.content.find(b => b.type === 'text')?.text || '{}';
+ const raw = msg.content.find(b => b.type === 'text')?.text || '{}';
+  const jsonMatch = raw.match(/\{[\s\S]*\}/);
+  const jsonStr = jsonMatch ? jsonMatch[0] : raw;
   try {
-    return JSON.parse(raw);
+    return JSON.parse(jsonStr);
   } catch {
     return { categoria: 'Nota', tag: [], titolo: 'nota-senza-titolo' };
   }
