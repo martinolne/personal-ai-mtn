@@ -158,6 +158,16 @@ async function transcribeAudio(buffer, mimeType) {
     .trim();
 }
 
+// Rende sicuro un testo da inserire in una risposta XML (TwiML)
+function escapeXml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
 function extensionFromMimeType(mimeType) {
   const map = {
     'image/jpeg': 'jpg',
@@ -262,7 +272,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
       });
 
       return res.send(
-        `<Response><Message>Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}</Message></Response>`
+        `<Response><Message>Salvato in ${escapeXml(folderName)}/${escapeXml(filename)}\nCategoria: ${escapeXml(categoria)}\nTag: ${escapeXml((tag || []).join(', '))}</Message></Response>`
       );
     }
 
@@ -287,7 +297,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
       });
 
       return res.send(
-        `<Response><Message>Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}\n\nTrascrizione: ${transcript}</Message></Response>`
+        `<Response><Message>Salvato in ${escapeXml(folderName)}/${escapeXml(filename)}\nCategoria: ${escapeXml(categoria)}\nTag: ${escapeXml((tag || []).join(', '))}\n\nTrascrizione: ${escapeXml(transcript)}</Message></Response>`
       );
     }
 
@@ -313,7 +323,7 @@ app.post('/webhook/whatsapp', async (req, res) => {
     });
 
     res.send(
-      `<Response><Message>Salvato in ${folderName}/${filename}\nCategoria: ${categoria}\nTag: ${(tag || []).join(', ')}</Message></Response>`
+      `<Response><Message>Salvato in ${escapeXml(folderName)}/${escapeXml(filename)}\nCategoria: ${escapeXml(categoria)}\nTag: ${escapeXml((tag || []).join(', '))}</Message></Response>`
     );
   } catch (err) {
     console.error(err);
